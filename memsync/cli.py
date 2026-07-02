@@ -1,0 +1,683 @@
+#!/usr/bin/env python3
+"""memsync — Codex <-> Claude Code 記憶/規則 雙向同步器。
+
+P1 已實作（唯讀，不寫任何工具檔）：
+  scan   跨兩側採集 + 對映，印出「哪些記憶/規則屬哪個邏輯專案」報告
+  map    產/列 project_map.json 人工對照骨架 + suspected-pair 待確認清單
+  status 印 hub 現況
+
+P2+ 佔位（尚未實作寫回）：plan / diff / apply / verify / rollback
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import hashlib
+import json
+import os
+import shutil
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import _v3mapper as m       # noqa: E402
+import identity as ident    # noqa: E402
+import readers              # noqa: E402
+import normalize as norm    # noqa: E402
+import blocks               # noqa: E402
+import store                # noqa: E402
+import rules                # noqa: E402
+import integrate as integ   # noqa: E402
+
+HUB = Path(__file__).resolve().parent.parent
+PROJECT_MAP = HUB / "project_map.json"
+CANONICAL = HUB / "canonical"
+RUNS = HUB / "runs"
+STATE = HUB / "state.json"
+
+
+def _collect(pm):
+    return readers.read_claude(pm) + readers.read_codex(pm)
+
+
+def _bucketize(items):
+    buckets = defaultdict(lambda: {
+        "title": None, "methods": set(), "roots": set(),
+        "claude_mem": 0, "codex_mem": 0, "claude_rule": 0, "codex_rule": 0,
+    })
+    disposable, meta = [], []
+    for it in items:
+        if it.meta:
+            meta.append(it)
+            continue
+        if it.disposable:
+            disposable.append(it)
+            continue
+        b = buckets[it.logical_id]
+        if it.title and not b["title"]:
+            b["title"] = it.title
+        b["methods"].add(it.method)
+        if it.marker_root:
+            b["roots"].add(it.marker_root)
+        b[f"{it.side}_{'rule' if it.kind == 'rule' else 'mem'}"] += 1
+    return buckets, disposable, meta
+
+
+def _short(p):
+    return str(p).replace(str(Path.home()), "~")
+
+
+def _suspected_pairs(buckets):
+    """token 相似卻落在不同 id 的桶 → 提示人工建 override。
+
+    從『單側桶』出發，與『所有真實桶（含兩側桶）』比對：這樣某側純本地的
+    checkout 才能對上已在兩側桶的同名 repo。只是提示、不自動併。
+    """
+    def toks_of(b):
+        t = set()
+        for r in b["roots"]:
+            t |= m.tokenize(Path(r).name)
+        return t
+
+    def both(b):
+        return (b["claude_mem"] + b["claude_rule"] > 0) and (b["codex_mem"] + b["codex_rule"] > 0)
+
+    real = [(lid, b, toks_of(b)) for lid, b in buckets.items()
+            if lid not in (ident.GLOBAL_ID, ident.UNASSIGNED)]
+    pairs, seen = [], set()
+    for lid, b, tk in real:
+        if both(b):
+            continue  # 只從單側桶當種子
+        for lid2, b2, tk2 in real:
+            if lid2 == lid:
+                continue
+            key = tuple(sorted((lid, lid2)))
+            if key in seen:
+                continue
+            overlap = tk & tk2
+            if overlap:
+                seen.add(key)
+                pairs.append((lid, lid2, sorted(overlap), b, b2))
+    pairs.sort(key=lambda x: -len(x[2]))
+    return pairs
+
+
+def cmd_scan(args):
+    pm = ident.load_project_map(PROJECT_MAP)
+    items = _collect(pm)
+    buckets, disposable, meta = _bucketize(items)
+
+    real = {k: v for k, v in buckets.items() if k not in (ident.GLOBAL_ID, ident.UNASSIGNED)}
+    both_sides = {k: v for k, v in real.items()
+                  if (v["claude_mem"] + v["claude_rule"] > 0) and (v["codex_mem"] + v["codex_rule"] > 0)}
+    claude_only = {k: v for k, v in real.items() if (v["codex_mem"] + v["codex_rule"] == 0)}
+    codex_only = {k: v for k, v in real.items() if (v["claude_mem"] + v["claude_rule"] == 0)}
+    pairs = _suspected_pairs(buckets)
+
+    lines = []
+    p = lines.append
+    p("# memsync scan 報告（唯讀，未寫任何工具檔）")
+    p(f"\n- 產生時間：{datetime.now().isoformat(timespec='seconds')}")
+    p(f"- 採集：Claude {sum(1 for i in items if i.side=='claude')} 項 · Codex {sum(1 for i in items if i.side=='codex')} 項")
+    p(f"- 邏輯專案：{len(real)}（兩側都有 {len(both_sides)} · 僅Claude {len(claude_only)} · 僅Codex {len(codex_only)}）")
+    p(f"- 已濾除：拋棄夾 {len(disposable)} · 同步器自身(meta) {len(meta)}")
+
+    g = buckets.get(ident.GLOBAL_ID)
+    if g:
+        p(f"\n## 全域規則（global ↔ global）\n- Claude CLAUDE.md：{g['claude_rule']} · Codex AGENTS.md：{g['codex_rule']}（直接對映）")
+
+    def table(title, bk):
+        p(f"\n## {title}（{len(bk)}）")
+        if not bk:
+            p("- （無）")
+            return
+        p("\n| 邏輯專案 id | Claude記憶 | Codex記憶 | 對映法 | 解析路徑 |")
+        p("|---|---|---|---|---|")
+        for lid, b in sorted(bk.items(), key=lambda kv: -(kv[1]['claude_mem']+kv[1]['codex_mem'])):
+            root = _short(sorted(b["roots"])[0]) if b["roots"] else "—"
+            label = b["title"] or lid.replace("remote:", "git:").replace("path:", "")
+            p(f"| `{_short(label)[:42]}` | {b['claude_mem']} | {b['codex_mem']} | {'/'.join(sorted(b['methods']))} | {root[:48]} |")
+
+    table("★ 兩側都有 — 需雙向揉合", both_sides)
+    table("僅 Claude 有", claude_only)
+    table("僅 Codex 有", codex_only)
+
+    if pairs:
+        p(f"\n## ⚠ 疑似同源、待人工建 override（{len(pairs)}）")
+        p("這些是 token 相似卻被算成不同 id 的單側專案——很可能是同一邏輯專案在兩邊不同路徑/repo。")
+        for a, b, ov, ba, bb in pairs[:12]:
+            ra = _short(sorted(ba['roots'])[0]) if ba['roots'] else a
+            rb = _short(sorted(bb['roots'])[0]) if bb['roots'] else b
+            p(f"- 共同 token `{'/'.join(ov)}`：\n    - {ra}\n    - {rb}\n    → 若同源，在 project_map.json 用一個 id 把兩個路徑/remote 列進 match_cwds/match_remotes")
+
+    un = buckets.get(ident.UNASSIGNED)
+    if un and (un["claude_mem"] + un["codex_mem"]):
+        p(f"\n## 未對映 _unassigned（Claude {un['claude_mem']} · Codex {un['codex_mem']}）\n- cwd 不存在或無證據，暫不寫回，待人工認領。")
+
+    report = "\n".join(lines)
+    ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    run_dir = RUNS / ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "scan-report.md").write_text(report, encoding="utf-8")
+    (run_dir / "scan.json").write_text(json.dumps([it.__dict__ for it in items], ensure_ascii=False, indent=2), encoding="utf-8")
+    print(report)
+    print(f"\n[已存] {_short(run_dir / 'scan-report.md')}")
+    return 0
+
+
+def cmd_map(args):
+    pm = ident.load_project_map(PROJECT_MAP)
+    if not PROJECT_MAP.exists():
+        template = {
+            "_comment": "人工專案身份對照表。把『同一邏輯專案在兩邊的不同路徑/不同 git remote』用一個 id 收斂。memsync 對映優先序：override > git_remote > path。",
+            "projects": [],
+            "_examples": [{
+                "id": "example-project", "title": "範例：官網專案",
+                "match_remotes": ["https://github.com/your-org/example-repo"],
+                "match_cwds": ["/Users/you/Documents/example-project"],
+            }],
+            "disposable_allow": [],
+            "disposable_extra": [],
+        }
+        PROJECT_MAP.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"已建立 project_map.json 骨架：{_short(PROJECT_MAP)}")
+    else:
+        print(f"project_map.json 已存在（{len(pm.get('projects', []))} 條 override）：{_short(PROJECT_MAP)}")
+    print("→ 跑 `memsync scan` 看 suspected-pair，再把同源專案填進 projects[]。")
+    return 0
+
+
+def cmd_status(args):
+    pm = ident.load_project_map(PROJECT_MAP)
+    state = _load_state()
+    print(f"hub: {_short(HUB)}")
+    print(f"generation: {state.get('generation', 0)}")
+    print(f"project_map.json: {len(pm.get('projects', []))} 條 override")
+    print(f"runs/: {len(list(RUNS.glob('*'))) if RUNS.exists() else 0} 次掃描")
+    if CANONICAL.exists():
+        projs = [d for d in CANONICAL.iterdir() if d.is_dir()]
+        print(f"canonical/（中央倉）: {len(projs)} 個專案")
+        for d in sorted(projs):
+            ents = store.load_canonical_entries(CANONICAL, d.name)
+            by = defaultdict(int)
+            for e in ents:
+                by[e.origin_side] += 1
+            print(f"  - {d.name}: {len(ents)} 顆 {dict(by)}")
+    else:
+        print("canonical/（中央倉）: 空（先 ./msync collect）")
+    return 0
+
+
+def _load_state():
+    if STATE.exists():
+        try:
+            return json.loads(STATE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"generation": 0, "targets": {}}
+
+
+def _collect_into_canonical(pm, project, generation):
+    """讀兩側來源 → normalize → 寫進 canonical/<project>/entries/。
+
+    每次呼叫都是該 project 的完整權威快照：本輪沒被任何來源提到的既有 entry 視為
+    來源已刪除/搬移，由 store.merge_into_canonical 立即清除（無寬限期）。
+    回 (本輪 entries, added, updated, unchanged, removed)。"""
+    raws = [it for it in _collect(pm) if it.logical_id == project and it.kind == "memory"]
+    entries = []
+    for it in raws:
+        e = norm.entry_from_claude_memory(it) if it.side == "claude" else norm.entry_from_codex_rollout(it)
+        if e:
+            entries.append(e)
+    a, u, n, r = store.merge_into_canonical(CANONICAL, project, entries, generation)
+    return entries, a, u, n, r
+
+
+def _doc_block_op(path, text, kind, project, label, ts, typ):
+    """把一整份整合好的 markdown 包成受管 block 寫回。hash 以整段文字算。"""
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    new_h = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+    ok, reason = blocks.integrity_check(old, kind, project)
+    base = {"target": str(path), "typ": typ, "kind": kind, "project": project, "hash": new_h, "reason": "", "warn": ""}
+    if not ok:
+        return {**base, "action": "BLOCKED", "reason": reason, "old": old, "new": old}
+    if blocks.existing_hash(old, kind, project) == new_h:
+        return {**base, "action": "unchanged", "old": old, "new": old}
+    nb = blocks.render_doc_block(text, kind, project, label, ts)
+    new = blocks.upsert(old, nb, kind, project)
+    return {**base, "action": ("create" if not path.exists() else "update"), "old": old, "new": new,
+            "warn": blocks.growth_warn(old, new, kind, project)}
+
+
+def _integrated_granule_op(path, text, project):
+    new = blocks.render_integrated_granule(text, project)
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    action = "unchanged" if old == new else ("create" if not path.exists() else "update")
+    h = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+    return {"target": str(path), "typ": "granule", "kind": "granule", "project": project,
+            "hash": h, "reason": "", "warn": "", "action": action, "old": old, "new": new}
+
+
+def _index_op(path, project, ts):
+    kind = "memory-index"
+    old = path.read_text(encoding="utf-8") if path.exists() else ""
+    new_h = hashlib.sha256(("memsync-integrated-index:" + project).encode()).hexdigest()[:12]
+    ok, reason = blocks.integrity_check(old, kind, project)
+    base = {"target": str(path), "typ": "index", "kind": kind, "project": project, "hash": new_h, "reason": "", "warn": ""}
+    if not ok:
+        return {**base, "action": "BLOCKED", "reason": reason, "old": old, "new": old}
+    if blocks.existing_hash(old, kind, project) == new_h:
+        return {**base, "action": "unchanged", "old": old, "new": old}
+    nb = blocks.render_integrated_index(project, ts)
+    new = blocks.upsert(old, nb, kind, project)
+    return {**base, "action": ("create" if not path.exists() else "update"), "old": old, "new": new}
+
+
+def _ensure_integrated(pm, project, generation):
+    """輸入(entries)有變或還沒整合過 → 呼叫 LLM 整合並存 canonical/<project>/integrated.md。
+    回 (整合後文字 or None, changed:bool)。輸入沒變＝沿用既有整合版（冪等、不重跑 LLM）。
+    整合失敗時保守不覆蓋既有版。"""
+    entries = store.load_canonical_entries(CANONICAL, project)
+    if not entries:
+        return None, False
+    in_hash = store.input_hash(entries)
+    prev_text, prev_hash = store.load_integrated(CANONICAL, project)
+    if prev_text and prev_hash == in_hash:
+        return prev_text, False
+    text = integ.integrate_memory(entries, previous_integrated=prev_text)
+    if not text:
+        return prev_text, False
+    store.save_integrated(CANONICAL, project, text, in_hash, generation)
+    return text, True
+
+
+def _build_ops(pm, project):
+    """把該專案的『整合版』寫回兩側同一份（不再互補投影）：
+    Codex 側 AGENTS.md 受管 block、Claude 側一顆整合 granule ＋ MEMORY.md 索引。
+    只讀 canonical/<project>/integrated.md（整合須先由 _ensure_integrated 產生）。
+    孤兒清除：舊的 per-entry memsync-*.md 顆粒（改用整合版單檔後不再需要）一併刪除。"""
+    integrated, _ = store.load_integrated(CANONICAL, project)
+    entries = store.load_canonical_entries(CANONICAL, project)
+    raws = [it for it in _collect(pm) if it.logical_id == project]
+    codex_roots = sorted({it.marker_root for it in raws if it.side == "codex" and it.marker_root})
+    claude_roots = sorted({it.marker_root for it in raws if it.side == "claude" and it.marker_root})
+    claude_proj_dirs = sorted({it.extra.get("claude_project_dir") for it in raws
+                               if it.side == "claude" and it.extra.get("claude_project_dir")})
+    ts = datetime.now().isoformat(timespec="seconds")
+    ops = []
+    current_granule_targets = set()
+    if integrated:
+        for root in (codex_roots or claude_roots):
+            ops.append(_doc_block_op(Path(root) / "AGENTS.md", integrated, "memory", project,
+                                     "整合自 Claude Code + Codex", ts, "agents"))
+        for pdir in claude_proj_dirs:
+            mem = Path(pdir) / "memory"
+            gtarget = mem / f"memsync-{store._slug(project)}-integrated.md"
+            current_granule_targets.add(str(gtarget))
+            ops.append(_integrated_granule_op(gtarget, integrated, project))
+            ops.append(_index_op(mem / "MEMORY.md", project, ts))
+    state = _load_state()
+    for target, meta in state.get("targets", {}).items():
+        if meta.get("typ") == "granule" and meta.get("project") == project and target not in current_granule_targets:
+            ops.append({"target": target, "typ": "granule", "kind": "granule", "project": project,
+                        "hash": "", "reason": "改用整合版單檔，舊 per-entry 顆粒清除", "warn": "", "action": "delete",
+                        "old": "", "new": ""})
+    return ops, entries, [], []
+
+
+def cmd_collect(args):
+    project = args.project
+    pm = ident.load_project_map(PROJECT_MAP)
+    state = _load_state()
+    gen = state.get("generation", 0) + 1
+    entries, a, u, n, r = _collect_into_canonical(pm, project, gen)
+    if not entries and not store.load_canonical_entries(CANONICAL, project):
+        print(f"專案 `{project}` 無可採集記憶（跑 ./msync scan 看可用 id）")
+        return 1
+    state["generation"] = gen
+    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    all_entries = store.load_canonical_entries(CANONICAL, project)
+    by_side = defaultdict(int)
+    for e in all_entries:
+        by_side[e.origin_side] += 1
+    print(f"# collect → 中央倉（generation {gen}）")
+    print(f"專案 `{project}`：本輪採集 {len(entries)} 顆（新增 {a} · 更新 {u} · 未變 {n} · 清除殭屍 {r}）")
+    print(f"canonical/{project}/entries/ 現有 {len(all_entries)} 顆：{dict(by_side)}")
+    print(f"→ 下一步：./msync plan --project {project}")
+    return 0
+
+
+_TAG = {"agents": "AGENTS.md", "granule": "memory顆粒", "index": "MEMORY.md索引", "rules": "規則"}
+
+
+def _write_ops(ops):
+    """實寫 create/update/delete ops，更新 state.targets。generation 只由 collect 推進，apply 不動它。"""
+    state = _load_state()
+    gen = state.get("generation", 0)
+    n = 0
+    for o in ops:
+        if o["action"] == "delete":
+            Path(o["target"]).unlink(missing_ok=True)
+            state.get("targets", {}).pop(o["target"], None)
+            n += 1
+            continue
+        if o["action"] not in ("create", "update"):
+            continue
+        p = Path(o["target"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(o["new"], encoding="utf-8")
+        state.setdefault("targets", {})[o["target"]] = {
+            "typ": o["typ"], "kind": o["kind"], "project": o["project"], "hash": o["hash"],
+            "written_at": datetime.now().isoformat(timespec="seconds"), "generation": gen,
+        }
+        n += 1
+    if n:
+        state["last_apply"] = datetime.now().isoformat(timespec="seconds")
+        STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return n
+
+
+def _apply_ops(ops, yes, title):
+    for b in [o for o in ops if o["action"] == "BLOCKED"]:
+        print(f"⛔ 跳過（完整性閘）：{_short(b['target'])} — {b['reason']}")
+    for o in ops:
+        if o.get("warn"):
+            print(f"  {o['warn']} @ {_short(o['target'])}")
+    writes = [o for o in ops if o["action"] in ("create", "update", "delete")]
+    if not writes:
+        print(f"{title}：沒有要寫的變更（全部 unchanged 或 blocked）。")
+        return 0
+    print(f"{title} 即將寫入/刪除：")
+    for o in writes:
+        label = "刪除殭屍檔" if o["action"] == "delete" else o["action"]
+        print(f"  [{label}] [{_TAG.get(o['typ'], o['typ'])}] {_short(o['target'])}")
+    if not yes:
+        print("（dry-run；加 --yes 才實寫）")
+        return 0
+    n = _write_ops(ops)
+    print(f"✓ {title} 已處理 {n} 檔。")
+    return n
+
+
+def cmd_plan(args):
+    project = args.project
+    pm = ident.load_project_map(PROJECT_MAP)
+    if not store.load_canonical_entries(CANONICAL, project):
+        print(f"中央倉 canonical/{project}/ 是空的——先跑 ./msync collect --project {project}")
+        return 1
+    print("整合中（輸入有變才呼叫 LLM，可能需數分鐘）…")
+    integrated, changed = _ensure_integrated(pm, project, _load_state().get("generation", 0))
+    if not integrated:
+        print(f"專案 `{project}` 尚無整合版（整合失敗或無來源）。")
+        return 1
+    print(f"整合版：{'本輪重新整合' if changed else '輸入未變，沿用既有整合版'}（{len(integrated)} 字）")
+    ops, entries, _, _ = _build_ops(pm, project)
+    if not ops:
+        print(f"專案 `{project}` 無寫回目標（缺 Codex 作業根或 Claude 專案目錄）")
+        return 1
+    print("# plan（中央倉整合版 → 兩側寫回同一份 · dry-run · 未寫任何檔）")
+    print(f"專案：{project} · {len(entries)} 顆來源 → 整合成 1 份，兩側同步")
+    agg = defaultdict(int)
+    for op in ops:
+        agg[op["action"]] += 1
+    print("動作：" + " · ".join(f"{k} {v}" for k, v in sorted(agg.items())))
+    for op in ops:
+        print(f"\n## {op['action'].upper()} [{_TAG[op['typ']]}] {_short(op['target'])}")
+        if op.get("warn"):
+            print(f"  {op['warn']}")
+        if op["action"] == "BLOCKED":
+            print(f"  ⛔ 完整性硬閘擋下：{op['reason']}（拒寫）")
+            continue
+        if op["action"] == "unchanged":
+            print("  ✓ 一致（hash 相同），跳過")
+            continue
+        if op["action"] == "delete":
+            print(f"  🗑 {op['reason']}，這個 memory 顆粒檔會被刪除")
+            continue
+        diff = list(difflib.unified_diff(op["old"].splitlines(), op["new"].splitlines(),
+                                         fromfile="(現況)", tofile="(套用後)", lineterm=""))
+        for line in diff[:40]:
+            print("  " + line)
+        if len(diff) > 40:
+            print(f"  …（diff 共 {len(diff)} 行，截前 40）")
+    print(f"\n→ 確認後：./msync apply --project {project} --yes")
+    return 0
+
+
+def cmd_apply(args):
+    project = args.project
+    pm = ident.load_project_map(PROJECT_MAP)
+    if not store.load_canonical_entries(CANONICAL, project):
+        print(f"中央倉 canonical/{project}/ 是空的——先跑 ./msync collect --project {project}")
+        return 1
+    _ensure_integrated(pm, project, _load_state().get("generation", 0))
+    ops, *_ = _build_ops(pm, project)
+    _apply_ops(ops, args.yes, f"apply {project}")
+    return 0
+
+
+def _mtime(p):
+    try:
+        return Path(p).stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def _ensure_integrated_rule(scope, c_rule, x_rule, c_mtime, x_mtime):
+    """兩側人工規則 LLM 整合成一份（衝突以較新來源檔為準）。input-hash 閘：規則沒變不重跑。"""
+    ih = store.rule_input_hash(c_rule or "", x_rule or "")
+    prev, prev_h = store.load_integrated_rule(CANONICAL, scope)
+    if prev and prev_h == ih:
+        return prev
+    text = integ.integrate_rules(c_rule, x_rule, previous_integrated=prev,
+                                 claude_mtime=c_mtime, codex_mtime=x_mtime)
+    if not text:
+        return prev
+    store.save_integrated_rule(CANONICAL, scope, text, ih)
+    return text
+
+
+def _build_rule_ops(pm):
+    """規則層整合：兩側人工規則揉成一份（較新檔勝），兩側寫回同一份整合規則。
+    互補投影邏輯保留在『寫哪一側』：只有當對方也有規則、才把整合版寫進這一側（避免單側自我回寫）。"""
+    ts = datetime.now().isoformat(timespec="seconds")
+    skip = {str(Path(x).expanduser().resolve()) for x in pm.get("rules_skip_targets", [])}
+    ops = []
+
+    def emit(path, text, scope):
+        if str(Path(path).resolve()) in skip:
+            return
+        ops.append(_doc_block_op(Path(path), text, "rules", scope, "整合自 Claude Code + Codex 規則", ts, "rules"))
+
+    # 全域
+    cr = rules.human_rule(rules.CLAUDE_GLOBAL)
+    xr = rules.human_rule(rules.CODEX_GLOBAL)
+    if cr or xr:
+        integrated = _ensure_integrated_rule("GLOBAL", cr, xr, _mtime(rules.CLAUDE_GLOBAL), _mtime(rules.CODEX_GLOBAL))
+        if integrated:
+            if cr:
+                emit(rules.CODEX_GLOBAL, integrated, "__GLOBAL__")
+            if xr:
+                emit(rules.CLAUDE_GLOBAL, integrated, "__GLOBAL__")
+
+    # 每專案
+    items = _collect(pm)
+    for proj in sorted({it.logical_id for it in items if it.logical_id not in (ident.GLOBAL_ID, ident.UNASSIGNED)}):
+        raws = [it for it in items if it.logical_id == proj]
+        c_roots = sorted({it.marker_root for it in raws if it.side == "claude" and it.marker_root})
+        x_roots = sorted({it.marker_root for it in raws if it.side == "codex" and it.marker_root})
+        c_files = [Path(x) / "CLAUDE.md" for x in c_roots]
+        x_files = [Path(x) / "AGENTS.md" for x in x_roots]
+        c_rule = next((r for r in (rules.human_rule(f) for f in c_files) if r), None)
+        x_rule = next((r for r in (rules.human_rule(f) for f in x_files) if r), None)
+        if not (c_rule or x_rule):
+            continue
+        c_mt = max([_mtime(f) for f in c_files], default=0.0)
+        x_mt = max([_mtime(f) for f in x_files], default=0.0)
+        integrated = _ensure_integrated_rule(proj, c_rule, x_rule, c_mt, x_mt)
+        if not integrated:
+            continue
+        if c_rule:
+            for x in (x_roots or c_roots):
+                emit(Path(x) / "AGENTS.md", integrated, proj)
+        if x_rule:
+            for x in (c_roots or x_roots):
+                emit(Path(x) / "CLAUDE.md", integrated, proj)
+    return ops
+
+
+def cmd_rules(args):
+    pm = ident.load_project_map(PROJECT_MAP)
+    print("規則整合中（剝除 memsync 區塊後的人工規則 → LLM 揉成一份，衝突以較新來源檔為準；規則有變才呼叫 LLM）…")
+    ops = _build_rule_ops(pm)
+    if not ops:
+        print("沒有可同步的人工規則（兩側規則檔皆空或不存在）。")
+        return 0
+    print("# rules（規則層整合 · 兩側寫回同一份整合規則 · 較新檔勝）")
+    if not args.yes:
+        for o in ops:
+            print(f"\n## {o['action'].upper()} [{_TAG.get(o['typ'], o['typ'])}] {_short(o['target'])}")
+            if o.get("warn"):
+                print(f"  {o['warn']}")
+            if o["action"] == "BLOCKED":
+                print(f"  ⛔ {o['reason']}")
+                continue
+            if o["action"] == "unchanged":
+                print("  ✓ 一致，跳過")
+                continue
+            diff = list(difflib.unified_diff(o["old"].splitlines(), o["new"].splitlines(),
+                                             fromfile="(現況)", tofile="(套用後)", lineterm=""))
+            for line in diff[:24]:
+                print("  " + line)
+            if len(diff) > 24:
+                print(f"  …（diff 共 {len(diff)} 行，截前 24）")
+        print("\n→ 確認後：./msync rules --yes")
+        return 0
+    _apply_ops(ops, True, "rules")
+    return 0
+
+
+def cmd_sync(args):
+    pm = ident.load_project_map(PROJECT_MAP)
+    if args.all:
+        items = _collect(pm)
+        agg = defaultdict(lambda: [0, 0])
+        all_ids = set()
+        for it in items:
+            if it.logical_id in (ident.GLOBAL_ID, ident.UNASSIGNED):
+                continue
+            all_ids.add(it.logical_id)
+            agg[it.logical_id][0 if it.side == "claude" else 1] += 1
+        dual_ids = sorted(p for p, v in agg.items() if v[0] > 0 and v[1] > 0)
+        print(f"兩側都有的專案（{len(dual_ids)}）：{dual_ids or '（無）'}")
+
+        existing_canonical = {d.name for d in CANONICAL.iterdir()
+                              if d.is_dir() and not d.name.startswith("__")} if CANONICAL.exists() else set()
+        orphans = existing_canonical - all_ids
+        for oid in sorted(orphans):
+            shutil.rmtree(CANONICAL / oid, ignore_errors=True)
+            print(f"  🗑 專案身份已消失（可能路徑改名/搬移），整批清除 canonical/{oid}/")
+
+        # 需要 collect（清殭屍 entry）：現存 canonical 且仍有任一側現況 ∪ 現在才變雙側的新專案
+        collect_ids = sorted((existing_canonical & all_ids) | set(dual_ids))
+        projects = collect_ids
+        # 已知殘留限制：若專案從雙側掉回單側，其 AGENTS.md/memory 顆粒不會在此清空，
+        # 只有 canonical 內容會被 collect 清乾淨；完整清空受管 block 需之後再補。
+    elif args.project:
+        projects = [args.project]
+        dual_ids = None
+    else:
+        print("用法：./msync sync --project <id> 或 ./msync sync --all")
+        return 1
+    total = 0
+    for proj in projects:
+        state = _load_state()
+        gen = state.get("generation", 0) + 1
+        _, a, u, n, r = _collect_into_canonical(pm, proj, gen)
+        state["generation"] = gen
+        STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        if r:
+            print(f"  🗑 [{proj}] 清除 {r} 顆殭屍 canonical entry")
+        if dual_ids is not None and proj not in dual_ids:
+            continue  # 只有仍是雙側的專案才進 distribute（已知殘留限制，見上）
+        _, changed = _ensure_integrated(pm, proj, gen)
+        if changed:
+            print(f"  ⟳ [{proj}] 整合版已重新生成（LLM）")
+        ops, *_ = _build_ops(pm, proj)
+        total += _apply_ops(ops, args.yes, f"[{proj}]")
+    if args.yes:
+        print(f"\n✓ sync 完成，共處理 {total} 檔。")
+    return 0
+
+
+def cmd_verify(args):
+    """冪等自檢：重算 ops，確認既有受管內容與現況一致（無漂移）。"""
+    project = args.project
+    pm = ident.load_project_map(PROJECT_MAP)
+    if not store.load_canonical_entries(CANONICAL, project):
+        print(f"中央倉 canonical/{project}/ 是空的")
+        return 1
+    ops, *_ = _build_ops(pm, project)
+    drift = [o for o in ops if o["action"] in ("create", "update", "delete")]
+    blocked = [o for o in ops if o["action"] == "BLOCKED"]
+    for o in ops:
+        print(f"  {o['action']:9} [{_TAG[o['typ']]}] {_short(o['target'])}")
+    ok = not drift and not blocked
+    print(f"結論：{'✓ 冪等（無漂移）' if ok else '⚠ 有差異/擋閘'}")
+    return 0 if ok else 1
+
+
+def _todo(args):
+    print(f"[{args._name}] 尚未實作（P3+）。目前開放：scan/map/status/plan/apply/verify。")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="memsync", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("scan", help="跨兩側採集+對映報告（唯讀）").set_defaults(func=cmd_scan)
+    sub.add_parser("map", help="產/列 project_map.json 人工對照").set_defaults(func=cmd_map)
+    sub.add_parser("status", help="印 hub 現況").set_defaults(func=cmd_status)
+
+    sp_collect = sub.add_parser("collect", help="兩側來源 → 寫進中央倉 canonical/（generation 疊代）")
+    sp_collect.add_argument("--project", required=True)
+    sp_collect.set_defaults(func=cmd_collect)
+
+    sp_plan = sub.add_parser("plan", help="dry-run：中央倉→兩側 受管 block diff（不寫）")
+    sp_plan.add_argument("--project", required=True)
+    sp_plan.set_defaults(func=cmd_plan)
+
+    sp_apply = sub.add_parser("apply", help="記憶層寫回受管 block（需 --yes）")
+    sp_apply.add_argument("--project", required=True)
+    sp_apply.add_argument("--yes", action="store_true")
+    sp_apply.set_defaults(func=cmd_apply)
+
+    sp_verify = sub.add_parser("verify", help="冪等自檢（重算 ops 確認無漂移）")
+    sp_verify.add_argument("--project", required=True)
+    sp_verify.set_defaults(func=cmd_verify)
+
+    sp_rules = sub.add_parser("rules", help="規則層雙向互寫（CLAUDE.md ↔ AGENTS.md，剝除 memsync 區塊）")
+    sp_rules.add_argument("--yes", action="store_true")
+    sp_rules.set_defaults(func=cmd_rules)
+
+    sp_sync = sub.add_parser("sync", help="一鍵 collect+apply（記憶層）；--all 跑所有兩側都有的專案")
+    sp_sync.add_argument("--project", default=None)
+    sp_sync.add_argument("--all", action="store_true")
+    sp_sync.add_argument("--yes", action="store_true")
+    sp_sync.set_defaults(func=cmd_sync)
+
+    for name in ("diff", "rollback"):
+        sp = sub.add_parser(name, help="P3+ 尚未實作")
+        sp.set_defaults(func=_todo, _name=name)
+    args = parser.parse_args()
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

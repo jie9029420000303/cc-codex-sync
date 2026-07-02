@@ -1,0 +1,16 @@
+{
+  "_comment": "人工專案身份對照表範本。第一次使用請複製一份成 project_map.json（該檔已 gitignore，屬個人設定不進 git）：cp project_map.example.json project_map.json",
+  "_usage": "把『同一邏輯專案在兩邊的不同路徑/不同 git remote』用一個 id 收斂。memsync 對映優先序：override > git_remote > path。先跑 ./msync scan 看 suspected-pair 提示，再填進 projects[]。",
+  "projects": [
+    {
+      "id": "example-project",
+      "title": "範例：官網專案",
+      "match_remotes": ["https://github.com/your-org/example-repo"],
+      "match_cwds": ["/Users/you/Documents/example-project"]
+    }
+  ],
+  "disposable_allow": [],
+  "disposable_extra": [],
+  "_rules_skip_note": "rules 指令不會寫入這裡列出的規則檔（例如你不想讓對方工具的規則注入到自己的全域 CLAUDE.md/AGENTS.md）。",
+  "rules_skip_targets": []
+}

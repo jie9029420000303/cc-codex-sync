@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# memsync 執行捷徑：./msync scan | map | status
+exec python3 "$(dirname "$0")/memsync/cli.py" "$@"

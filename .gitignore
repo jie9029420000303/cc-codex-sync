@@ -1,0 +1,18 @@
+# Claude Code session data (not part of the tool)
+.claude/
+# python
+__pycache__/
+*.pyc
+# large raw snapshots
+inbox/
+.DS_Store
+
+# 工具本體 vs 個人資料分離（推給同事用時，只共用 memsync/ 程式，不共用個人記憶內容）：
+# canonical/、state.json、runs/ 都可由 collect/scan 重新生成，不是不可逆資料。
+# project_map.json 含個人專案路徑對照，改用 project_map.example.json 當共用範本。
+canonical/
+state.json
+runs/
+project_map.json
+# 個人環境的舊 cron 備份，不隨工具發布
+superseded/
