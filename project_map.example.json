@@ -12,5 +12,7 @@
   "disposable_allow": [],
   "disposable_extra": [],
   "_rules_skip_note": "rules 指令不會寫入這裡列出的規則檔（例如你不想讓對方工具的規則注入到自己的全域 CLAUDE.md/AGENTS.md）。",
-  "rules_skip_targets": []
+  "rules_skip_targets": [],
+  "_mcp_env_note": "MCP 機密外抽的共用 env 檔位置（chmod 600、勿入 git、該資料夾勿設共用）。留空由 ./msync setup 自動偵測：有 Google Drive 資料夾（如 ~/我的雲端硬碟）→ <雲端硬碟>/memsync/mcp.env（記得在 Drive 標『離線可用』），否則 ~/.config/memsync/mcp.env。",
+  "mcp_env_file": ""
 }
