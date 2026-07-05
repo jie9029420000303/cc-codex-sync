@@ -31,6 +31,9 @@ import blocks               # noqa: E402
 import store                # noqa: E402
 import rules                # noqa: E402
 import integrate as integ   # noqa: E402
+import skillsync            # noqa: E402
+import mcpsync              # noqa: E402
+import pluginsync           # noqa: E402
 
 HUB = Path(__file__).resolve().parent.parent
 PROJECT_MAP = HUB / "project_map.json"
@@ -198,7 +201,7 @@ def cmd_status(args):
     print(f"project_map.json: {len(pm.get('projects', []))} 條 override")
     print(f"runs/: {len(list(RUNS.glob('*'))) if RUNS.exists() else 0} 次掃描")
     if CANONICAL.exists():
-        projs = [d for d in CANONICAL.iterdir() if d.is_dir()]
+        projs = [d for d in CANONICAL.iterdir() if d.is_dir() and not d.name.startswith("__")]
         print(f"canonical/（中央倉）: {len(projs)} 個專案")
         for d in sorted(projs):
             ents = store.load_canonical_entries(CANONICAL, d.name)
@@ -206,6 +209,13 @@ def cmd_status(args):
             for e in ents:
                 by[e.origin_side] += 1
             print(f"  - {d.name}: {len(ents)} 顆 {dict(by)}")
+        sk = CANONICAL / "__skills__"
+        if sk.exists():
+            n = sum(1 for _ in sk.glob("*/*/meta.json"))
+            print(f"技能層 __skills__: {n} 顆")
+        mc = CANONICAL / "__mcp__"
+        if mc.exists():
+            print(f"MCP 層 __mcp__: {sum(1 for _ in mc.glob('*.json'))} 顆 server")
     else:
         print("canonical/（中央倉）: 空（先 ./msync collect）")
     return 0
@@ -608,8 +618,269 @@ def cmd_sync(args):
             print(f"  ⟳ [{proj}] 整合版已重新生成（LLM）")
         ops, *_ = _build_ops(pm, proj)
         total += _apply_ops(ops, args.yes, f"[{proj}]")
+    if args.all and not getattr(args, "skip_skills", False):
+        print("\n" + "─" * 50)
+        total += _run_skills(pm, args.yes)
+    if args.all and not getattr(args, "skip_mcp", False):
+        print("\n" + "─" * 50)
+        total += _run_mcp(pm, args.yes)
     if args.yes:
         print(f"\n✓ sync 完成，共處理 {total} 檔。")
+    return 0
+
+
+_SKILL_TAG = {"mirror": "鏡像", "delete": "刪除殭屍技能", "canonical": "中央倉",
+              "canonical_delete": "中央倉清除", "remove_marker": "升級為來源(移除標記)"}
+
+
+def _run_skills(pm, yes):
+    """技能層：全域＋專案級 SKILL.md 資料夾雙向鏡像。回實寫檔數。"""
+    state = _load_state()
+    gen = state.get("generation", 0) + 1
+    extra = {it.marker_root for it in _collect(pm) if it.marker_root}
+    pairs = skillsync.sync_pairs(pm, extra)
+    all_ops, all_warns = [], []
+    ts = datetime.now().isoformat(timespec="seconds")
+    print("# skills（SKILL.md 整包雙向鏡像 · generation 新疊舊 · .memsync-origin 防回授）")
+    for scope, c_root, x_root in pairs:
+        c_sk, x_sk = skillsync.scan_root(c_root), skillsync.scan_root(x_root)
+        if not c_sk and not x_sk and not (CANONICAL / "__skills__" / scope).exists():
+            continue
+        decisions, conflicts = skillsync.merge_pair(CANONICAL, scope, c_sk, x_sk, gen)
+        ops, warns = skillsync.build_ops(CANONICAL, scope, c_root, x_root, decisions, c_sk, x_sk, gen, ts)
+        label = "全域" if scope == skillsync.GLOBAL_SCOPE else scope
+        n_un = sum(1 for d in decisions.values() if d["action"] == "unchanged")
+        print(f"\n## [{label}] claude {len(c_sk)} 顆 ↔ codex {len(x_sk)} 顆（unchanged {n_un}）")
+        for w in conflicts:
+            print(f"  {w}")
+        for o in ops:
+            print(f"  [{_SKILL_TAG[o['action']]}] {o['name']} → {_short(o['target'])}")
+        for w in warns:
+            print(w)
+        if not ops and not conflicts:
+            print("  ✓ 兩側一致，無動作")
+        all_ops += ops
+        all_warns += warns
+    if not all_ops:
+        print("\nskills：沒有要寫的變更。")
+        return 0
+    if not yes:
+        print(f"\n（dry-run；共 {len(all_ops)} 個動作，加 --yes 才實寫）")
+        return 0
+    n = skillsync.apply_ops(all_ops)
+    state["generation"] = gen
+    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n✓ skills 已處理 {n} 個動作（generation {gen}）。")
+    return n
+
+
+def cmd_skills(args):
+    pm = ident.load_project_map(PROJECT_MAP)
+    _run_skills(pm, args.yes)
+    return 0
+
+
+def _mcp_classify(side, name, h, managed):
+    m = (managed.get(side) or {}).get(name)
+    return "mirror" if m == h else "source"
+
+
+def _run_mcp(pm, yes):
+    """MCP 層：機密外抽 → 中立描述 → 缺側補齊（受管鏡像）。回實寫檔數。"""
+    envp = mcpsync.env_file_path(pm)
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    state = _load_state()
+    gen = state.get("generation", 0) + 1
+    managed = state.get("mcp_managed", {"claude": {}, "codex": {}})
+    c_servers, c_cfg_all = mcpsync.load_claude_servers()
+    x_human, x_managed_toml, x_text = mcpsync.load_codex_servers()
+    print("# mcp（機密外抽 → JSON ⇄ 中立描述 ⇄ TOML · 受管互寫）")
+    print(f"共用機密檔：{_short(envp)}")
+    writes = 0
+
+    # ── 階段一：機密外抽（含撞名硬閘）──
+    c_found = mcpsync.scan_secrets_claude(c_servers)
+    x_found = mcpsync.scan_secrets_codex(x_human)
+    env_vals = mcpsync.load_env_file(envp)
+    new_vars, collisions = {}, []
+    for name, loc, k, v, _newv in c_found:
+        var = k if loc == "env" else mcpsync._varname(f"{name}_{k}")
+        if env_vals.get(var, v) != v or new_vars.get(var, v) != v:
+            collisions.append((name, var))
+        else:
+            new_vars[var] = v
+    for name, k, v in x_found:
+        var = mcpsync._varname(name + "_BEARER") if k == "__bearer__" else k
+        if env_vals.get(var, v) != v or new_vars.get(var, v) != v:
+            collisions.append((name, var))
+        else:
+            new_vars[var] = v
+    skip_servers = {c[0] for c in collisions}
+    for name, var in collisions:
+        print(f"⛔ 撞名硬閘：server `{name}` 的變數 {var} 與既有值不同 → 該 server 整顆跳過（不同步、不改寫）")
+    c_found = [f for f in c_found if f[0] not in skip_servers]
+    x_found = [f for f in x_found if f[0] not in skip_servers]
+
+    c_new_text = x_new_text = None
+    if c_found and c_cfg_all is not None:
+        c_new_text = mcpsync.rewrite_claude_secrets(json.loads(json.dumps(c_cfg_all)), c_found)
+        err = mcpsync.validate_claude(c_new_text, c_found)
+        if err:
+            print(f"⛔ Claude 設定改寫驗證失敗：{err}（不落地）")
+            c_new_text = None
+    if x_found and x_text:
+        x_new_text = mcpsync.rewrite_codex_secrets(x_text, x_found)
+        err = mcpsync.validate_codex(x_new_text, x_found)
+        if err:
+            print(f"⛔ Codex 設定改寫驗證失敗：{err}（不落地）")
+            x_new_text = None
+    if c_found or x_found:
+        print(f"\n## 機密外抽（{len(new_vars)} 個變數 → {_short(envp)}）")
+        for name, loc, k, v, newv in c_found:
+            print(f"  [claude:{name}] {loc}.{k} = {mcpsync.mask(v)} → {newv}")
+        for name, k, v in x_found:
+            var = mcpsync._varname(name + "_BEARER") if k == "__bearer__" else k
+            print(f"  [codex:{name}] env.{k if k != '__bearer__' else 'bearer_token'} = {mcpsync.mask(v)} → env_vars[{var}]")
+        print(f"  shell profile 請加一行：[ -f \"{envp}\" ] && source \"{envp}\"")
+        if yes:
+            merged = dict(env_vals)
+            merged.update(new_vars)
+            mcpsync.write_env_file(envp, merged)
+            writes += 1
+            if c_new_text is not None:
+                mcpsync.backup(mcpsync.claude_config_path(), ts)
+                mcpsync.claude_config_path().write_text(c_new_text, encoding="utf-8")
+                writes += 1
+            if x_new_text is not None:
+                mcpsync.backup(mcpsync.codex_config_path(), ts)
+                mcpsync.codex_config_path().write_text(x_new_text, encoding="utf-8")
+                writes += 1
+            print(f"  ✓ 已外抽並改寫（原檔備份 .memsync-bak-{ts}）")
+
+    # ── 用外抽後狀態（實寫後重讀；dry-run 用記憶體模擬）算描述 ──
+    if yes and (c_new_text or x_new_text):
+        c_servers, c_cfg_all = mcpsync.load_claude_servers()
+        x_human, x_managed_toml, x_text = mcpsync.load_codex_servers()
+    else:
+        if c_new_text:
+            c_servers = dict(json.loads(c_new_text).get("mcpServers") or {})
+        if x_new_text:
+            span = mcpsync._managed_span(x_new_text)
+            ht = (x_new_text[:span[0]] + x_new_text[span[1]:]) if span else x_new_text
+            x_human = dict(mcpsync.tomllib.loads(ht).get("mcp_servers") or {})
+
+    descs = {}
+    for side, servers, fn in (("claude", c_servers, mcpsync.descriptor_from_claude),
+                              ("codex", {**x_human, **x_managed_toml}, mcpsync.descriptor_from_codex)):
+        for name, cfg in servers.items():
+            if name in skip_servers:
+                continue
+            d, why = fn(name, cfg)
+            if d is None:
+                print(f"⛔ [{side}:{name}] 無法翻譯：{why}（跳過）")
+                continue
+            descs.setdefault(name, {})[side] = d
+
+    # ── 裁決：每顆 server 選出勝方描述（人工 vs 人工不一致 → 只警示不覆蓋）──
+    mdir = CANONICAL / "__mcp__"
+    mdir.mkdir(parents=True, exist_ok=True)
+    known = {f.stem for f in mdir.glob("*.json")} | set(descs)
+    wanted_codex, wanted_claude = {}, {}   # name → desc：該側應持有的受管鏡像（全量重生的基準）
+    canonical_writes = []                  # (path, meta or None＝刪)
+    for name in sorted(known):
+        sides = descs.get(name, {})
+        cf = mdir / f"{name}.json"
+        can = json.loads(cf.read_text(encoding="utf-8")) if cf.exists() else None
+        cls = {s: _mcp_classify(s, name, mcpsync.desc_hash(d), managed) for s, d in sides.items()}
+        sources = [(s, d) for s, d in sides.items() if cls[s] == "source"]
+        if not sources:
+            if can or sides:
+                print(f"  🗑 `{name}` 來源已刪 → 移除鏡像與中央倉")
+                canonical_writes.append((cf, None))
+            continue
+        if len(sources) == 2 and mcpsync.desc_hash(sources[0][1]) != mcpsync.desc_hash(sources[1][1]):
+            print(f"  ⚠ `{name}` 兩側人工設定不一致——memsync 只補缺、不改人工 server，請手動對齊")
+            continue
+        win_side, win = sources[0]
+        h = mcpsync.desc_hash(win)
+        if not can or can.get("content_sha256") != h:
+            canonical_writes.append((cf, {**win, "origin_side": win_side, "content_sha256": h,
+                                          "first_seen_generation": (can or {}).get("first_seen_generation", gen),
+                                          "last_seen_generation": gen}))
+        other = "codex" if win_side == "claude" else "claude"
+        if cls.get(other) == "source":
+            print(f"  ✓ `{name}` 兩側皆為人工且一致")
+            continue
+        (wanted_codex if other == "codex" else wanted_claude)[name] = win
+        if other not in sides:
+            print(f"  [補缺] `{name}`（{win_side} → {other}）")
+        elif mcpsync.desc_hash(sides[other]) != h:
+            print(f"  [更新鏡像] `{name}`（{win_side} → {other}）")
+        else:
+            print(f"  ✓ `{name}` 鏡像已同步")
+
+    # ── 寫回：codex 受管註解區全量重生；claude 受管 key 差異化增刪 ──
+    region = mcpsync.render_managed_region(list(wanted_codex.values()))
+    new_x = mcpsync.upsert_managed_region(x_text, region)
+    claude_adds, claude_dels = {}, []
+    for name, d in wanted_claude.items():
+        entry = mcpsync.claude_entry_from_desc(d)
+        if c_servers.get(name) != entry:
+            claude_adds[name] = entry
+    for name, old_h in (managed.get("claude") or {}).items():
+        cur = descs.get(name, {}).get("claude")
+        if name not in wanted_claude and cur is not None and mcpsync.desc_hash(cur) == old_h:
+            claude_dels.append(name)   # 純鏡像且不再需要 → 刪；被使用者改過的已升級為來源，不會進來
+
+    if new_x != x_text:
+        print(f"  [寫回] Codex 受管區（{len(wanted_codex)} 顆 server）→ {_short(mcpsync.codex_config_path())}")
+        if yes:
+            if mcpsync.codex_config_path().exists():
+                mcpsync.backup(mcpsync.codex_config_path(), ts)
+            mcpsync.codex_config_path().parent.mkdir(parents=True, exist_ok=True)
+            mcpsync.codex_config_path().write_text(new_x, encoding="utf-8")
+            writes += 1
+    if (claude_adds or claude_dels) and c_cfg_all is not None:
+        print(f"  [寫回] Claude mcpServers（＋{len(claude_adds)} －{len(claude_dels)}）→ {_short(mcpsync.claude_config_path())}")
+        if yes:
+            cur = json.loads(mcpsync.claude_config_path().read_text(encoding="utf-8"))
+            cur.setdefault("mcpServers", {})
+            for k, v in claude_adds.items():
+                cur["mcpServers"][k] = v
+            for k in claude_dels:
+                cur["mcpServers"].pop(k, None)
+            mcpsync.backup(mcpsync.claude_config_path(), ts)
+            mcpsync.claude_config_path().write_text(json.dumps(cur, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            writes += 1
+    if yes:
+        for cf, meta in canonical_writes:
+            if meta is None:
+                cf.unlink(missing_ok=True)
+            else:
+                cf.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        managed = {"claude": {n: mcpsync.desc_hash(d) for n, d in wanted_claude.items()},
+                   "codex": {n: mcpsync.desc_hash(d) for n, d in wanted_codex.items()}}
+
+    if yes:
+        state["mcp_managed"] = managed
+        state["generation"] = gen
+        STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n✓ mcp 已處理 {writes} 檔（generation {gen}）。")
+    else:
+        print("\n（dry-run；加 --yes 才實寫）")
+    return writes
+
+
+def cmd_mcp(args):
+    pm = ident.load_project_map(PROJECT_MAP)
+    _run_mcp(pm, args.yes)
+    return 0
+
+
+def cmd_plugins(args):
+    c_servers, _ = mcpsync.load_claude_servers()
+    x_h, x_m, _ = mcpsync.load_codex_servers()
+    print("\n".join(pluginsync.report(set(c_servers), set(x_h) | set(x_m))))
     return 0
 
 
@@ -663,11 +934,23 @@ def main():
     sp_rules.add_argument("--yes", action="store_true")
     sp_rules.set_defaults(func=cmd_rules)
 
-    sp_sync = sub.add_parser("sync", help="一鍵 collect+apply（記憶層）；--all 跑所有兩側都有的專案")
+    sp_sync = sub.add_parser("sync", help="一鍵 collect+apply（記憶層）；--all 跑所有兩側都有的專案＋自動串技能/MCP")
     sp_sync.add_argument("--project", default=None)
     sp_sync.add_argument("--all", action="store_true")
     sp_sync.add_argument("--yes", action="store_true")
+    sp_sync.add_argument("--skip-skills", action="store_true", help="--all 時跳過技能層")
+    sp_sync.add_argument("--skip-mcp", action="store_true", help="--all 時跳過 MCP 層")
     sp_sync.set_defaults(func=cmd_sync)
+
+    sp_skills = sub.add_parser("skills", help="技能層雙向鏡像（全域＋專案級 SKILL.md 整包 · 防回授標記）")
+    sp_skills.add_argument("--yes", action="store_true")
+    sp_skills.set_defaults(func=cmd_skills)
+
+    sp_mcp = sub.add_parser("mcp", help="MCP 層同步（機密外抽 → JSON⇄TOML 受管互寫）")
+    sp_mcp.add_argument("--yes", action="store_true")
+    sp_mcp.set_defaults(func=cmd_mcp)
+
+    sub.add_parser("plugins", help="plugin 拆解盤點（唯讀：列出內含技能/MCP 與對側覆蓋）").set_defaults(func=cmd_plugins)
 
     for name in ("diff", "rollback"):
         sp = sub.add_parser(name, help="P3+ 尚未實作")
