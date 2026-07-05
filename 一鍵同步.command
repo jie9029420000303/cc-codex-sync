@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # memsync 一鍵同步（在 Finder 雙擊即可執行）
-# 記憶層 sync --all + 規則層 rules，兩側寫回同一份整合版受管 block。冪等：沒變更就不動。
+# setup 自我引導 → 記憶層 sync --all（自動串技能層＋MCP 層）→ 規則層 rules。
+# 全程冪等：沒變更就不動；首次執行會自動偵測雲端硬碟、建 project_map、寫 shell 載入行。
 
 HUB="$(cd "$(dirname "$0")" && pwd)"
 CLI="$HUB/memsync/cli.py"
@@ -11,7 +12,10 @@ echo "==================================================="
 echo "  memsync 一鍵同步  ·  $(date '+%Y-%m-%d %H:%M')"
 echo "==================================================="
 echo
-echo ">>> 記憶層：sync --all（所有兩側都有的專案）"
+echo ">>> 自我引導：setup（首次自動配置，之後冪等跳過）"
+python3 "$CLI" setup
+echo
+echo ">>> 記憶層＋技能層＋MCP 層：sync --all"
 python3 "$CLI" sync --all --yes
 echo
 echo ">>> 規則層：rules（CLAUDE.md ↔ AGENTS.md）"

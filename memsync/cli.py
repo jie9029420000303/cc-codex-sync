@@ -877,6 +877,56 @@ def cmd_mcp(args):
     return 0
 
 
+def _detect_drive():
+    """自動偵測 Google Drive 資料夾（含中文/英文掛載名與 CloudStorage 實際掛載點）。"""
+    home = Path.home()
+    cands = [home / "我的雲端硬碟", home / "Google Drive"]
+    cs = home / "Library" / "CloudStorage"
+    if cs.exists():
+        for g in sorted(cs.glob("GoogleDrive-*")):
+            cands += [g / "我的雲端硬碟", g / "My Drive"]
+    for c in cands:
+        if c.is_dir():
+            return c
+    return None
+
+
+def cmd_setup(args):
+    """自我引導（冪等，可重複執行）：project_map／機密檔位置／shell profile 載入行，一次備齊。"""
+    print("# setup（自我引導，冪等）")
+    if not PROJECT_MAP.exists():
+        shutil.copy(HUB / "project_map.example.json", PROJECT_MAP)
+        print("✓ 已從範本建立 project_map.json")
+    pm = json.loads(PROJECT_MAP.read_text(encoding="utf-8"))
+    cur = (pm.get("mcp_env_file") or "").strip()
+    if not cur:
+        drive = _detect_drive()
+        envp = (drive / "memsync" / "mcp.env") if drive else Path.home() / ".config" / "memsync" / "mcp.env"
+        pm["mcp_env_file"] = str(envp)
+        PROJECT_MAP.write_text(json.dumps(pm, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"✓ 機密檔位置：{_short(envp)}" + ("（偵測到雲端硬碟，隨 Google 備份；資料夾勿設共用）" if drive else "（本機預設）"))
+    else:
+        envp = Path(cur).expanduser()
+        print(f"✓ 機密檔位置（沿用既有設定）：{_short(envp)}")
+    envp.parent.mkdir(parents=True, exist_ok=True)
+
+    marker = "# memsync mcp env"
+    line = f'[ -f "{envp}" ] && source "{envp}"  {marker}'
+    profiles = [p for p in (Path.home() / ".zshrc", Path.home() / ".bashrc") if p.exists()] \
+        or [Path.home() / ".zshrc"]
+    for prof in profiles:
+        text = prof.read_text(encoding="utf-8", errors="replace") if prof.exists() else ""
+        kept = [l for l in text.split("\n") if marker not in l]
+        new = "\n".join(kept).rstrip("\n") + ("\n" if any(s.strip() for s in kept) else "") + line + "\n"
+        if new != text:
+            prof.write_text(new, encoding="utf-8")
+            print(f"✓ 機密檔載入行已寫進 {_short(prof)}（開新終端機生效）")
+        else:
+            print(f"✓ {_short(prof)} 載入行已存在")
+    print("setup 完成。")
+    return 0
+
+
 def cmd_plugins(args):
     c_servers, _ = mcpsync.load_claude_servers()
     x_h, x_m, _ = mcpsync.load_codex_servers()
@@ -951,6 +1001,7 @@ def main():
     sp_mcp.set_defaults(func=cmd_mcp)
 
     sub.add_parser("plugins", help="plugin 拆解盤點（唯讀：列出內含技能/MCP 與對側覆蓋）").set_defaults(func=cmd_plugins)
+    sub.add_parser("setup", help="自我引導（冪等）：project_map／機密檔位置自動偵測／shell profile 載入行").set_defaults(func=cmd_setup)
 
     for name in ("diff", "rollback"):
         sp = sub.add_parser(name, help="P3+ 尚未實作")
