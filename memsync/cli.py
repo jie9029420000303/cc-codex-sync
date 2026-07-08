@@ -31,8 +31,18 @@ import blocks               # noqa: E402
 import store                # noqa: E402
 import rules                # noqa: E402
 import integrate as integ   # noqa: E402
+import compat               # noqa: E402
 
-HUB = Path(__file__).resolve().parent.parent
+# hub＝canonical/state/project_map 的家。
+# 從原始碼跑＝repo 目錄（維持既有行為）；打包成單檔執行檔跑＝~/.cc-codex-sync
+# （PyInstaller 的 __file__ 在解壓暫存區，不能當資料目錄）。可用環境變數覆蓋。
+if os.environ.get("CC_CODEX_SYNC_HOME"):
+    HUB = Path(os.environ["CC_CODEX_SYNC_HOME"]).expanduser().resolve()
+elif getattr(sys, "frozen", False):
+    HUB = Path.home() / ".cc-codex-sync"
+else:
+    HUB = Path(__file__).resolve().parent.parent
+HUB.mkdir(parents=True, exist_ok=True)
 PROJECT_MAP = HUB / "project_map.json"
 CANONICAL = HUB / "canonical"
 RUNS = HUB / "runs"
@@ -492,15 +502,17 @@ def _build_rule_ops(pm):
             return
         ops.append(_doc_block_op(Path(path), text, "rules", scope, "整合自 Claude Code + Codex 規則", ts, "rules"))
 
-    # 全域
-    cr = rules.human_rule(rules.CLAUDE_GLOBAL)
+    # 全域（Claude 側人工來源：rules-source.md 優先，不存在時 fallback CLAUDE.md 殘文）
+    cr, c_src = rules.claude_global_rule_source()
     xr = rules.human_rule(rules.CODEX_GLOBAL)
     if cr or xr:
-        integrated = _ensure_integrated_rule("GLOBAL", cr, xr, _mtime(rules.CLAUDE_GLOBAL), _mtime(rules.CODEX_GLOBAL))
+        integrated = _ensure_integrated_rule("GLOBAL", cr, xr, _mtime(c_src), _mtime(rules.CODEX_GLOBAL))
         if integrated:
             if cr:
                 emit(rules.CODEX_GLOBAL, integrated, "__GLOBAL__")
-            if xr:
+            # 來源為獨立檔 rules-source.md 時，CLAUDE.md 純屬寫回目標、無自我回寫疑慮，
+            # 不需靠「對側也有規則」才投影；fallback 模式（來源仍是 CLAUDE.md 殘文）維持舊條件。
+            if xr or (cr and c_src == rules.CLAUDE_RULES_SOURCE):
                 emit(rules.CLAUDE_GLOBAL, integrated, "__GLOBAL__")
 
     # 每專案
@@ -635,9 +647,75 @@ def _todo(args):
     return 0
 
 
+def cmd_setup(args):
+    """三步上手：①建 project_map.json ②scan 看對映 ③確認後 sync --all + rules。"""
+    print("=== cc-codex-sync 初次設定 ===\n")
+    if shutil.which("codex") is None and compat.codex_bin() == "codex":
+        print("⚠ 找不到 codex CLI：LLM 整合/去重會停用（其餘功能照常）。裝好 codex 後再跑一次即可。\n")
+    print(f"[1/3] 資料目錄：{_short(HUB)}")
+    cmd_map(args)  # 不存在就建 project_map.json 骨架
+    print("\n[2/3] 掃描兩側記憶/規則、產出專案對映報告（唯讀）…\n")
+    cmd_scan(args)
+    print("\n[3/3] 以上是兩側對映現況。若『疑似同源』清單有你認得的同一專案，")
+    print("      先去 project_map.json 補 override 再繼續；沒有就直接同步。")
+    try:
+        ans = input("\n現在執行第一次同步（sync --all + rules）？ [y/N] ").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans != "y":
+        print("已略過。之後可隨時執行：sync --all --yes 與 rules --yes")
+        return 0
+    ns = argparse.Namespace(project=None, all=True, yes=True)
+    cmd_sync(ns)
+    cmd_rules(argparse.Namespace(yes=True))
+    print("\n✓ 初次設定完成。日常只需重跑「同步」即可。")
+    return 0
+
+
+def _menu():
+    """雙擊執行檔（無參數＋互動終端）時的選單。"""
+    first_time = not PROJECT_MAP.exists()
+    print("=== cc-codex-sync — Claude Code ⇄ Codex 記憶/規則同步 ===")
+    print(f"    資料目錄：{_short(HUB)}\n")
+    items = [
+        ("1", "初次設定（建對照檔 → 掃描 → 首次同步）", lambda: cmd_setup(argparse.Namespace())),
+        ("2", "一鍵同步（記憶 sync --all + 規則 rules）",
+         lambda: (cmd_sync(argparse.Namespace(project=None, all=True, yes=True)),
+                  cmd_rules(argparse.Namespace(yes=True)))),
+        ("3", "看現況（status）", lambda: cmd_status(argparse.Namespace())),
+        ("4", "掃描對映報告（scan，唯讀）", lambda: cmd_scan(argparse.Namespace())),
+        ("0", "離開", None),
+    ]
+    for k, label, _ in items:
+        print(f"  {k}. {label}")
+    default = "1" if first_time else "2"
+    try:
+        pick = input(f"\n選擇 [{default}]: ").strip() or default
+    except EOFError:
+        return 0
+    for k, _, fn in items:
+        if pick == k:
+            if fn is None:
+                return 0
+            fn()
+            break
+    else:
+        print("無此選項。")
+    try:
+        input("\n完成。按 Enter 關閉。")
+    except EOFError:
+        pass
+    return 0
+
+
 def main():
+    compat.ensure_utf8_stdout()
+    # 無參數＋互動終端（雙擊執行檔的情境）→ 進選單；有參數照舊走 CLI
+    if len(sys.argv) == 1 and sys.stdin.isatty():
+        return _menu()
     parser = argparse.ArgumentParser(prog="memsync", description=__doc__)
     sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("setup", help="三步上手：建對照檔→掃描→首次同步（互動）").set_defaults(func=cmd_setup)
     sub.add_parser("scan", help="跨兩側採集+對映報告（唯讀）").set_defaults(func=cmd_scan)
     sub.add_parser("map", help="產/列 project_map.json 人工對照").set_defaults(func=cmd_map)
     sub.add_parser("status", help="印 hub 現況").set_defaults(func=cmd_status)

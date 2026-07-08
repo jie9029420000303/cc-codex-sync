@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import json
-import subprocess
 
-CODEX_BIN = "codex"
+import compat
+
 TIMEOUT_SECONDS = 25
 
 
@@ -19,10 +19,10 @@ def is_duplicate_topic(text_a: str, text_b: str) -> bool:
         f"=== 筆記 A ===\n{text_a[:3000]}\n\n=== 筆記 B ===\n{text_b[:3000]}\n"
     )
     try:
-        proc = subprocess.run(
-            [CODEX_BIN, "exec", "--skip-git-repo-check", "-s", "read-only",
+        proc = compat.run_codex(
+            ["exec", "--skip-git-repo-check", "-s", "read-only",
              "-c", "model_reasoning_effort=low", "--color", "never"],
-            input=prompt, capture_output=True, text=True, timeout=TIMEOUT_SECONDS,
+            prompt, TIMEOUT_SECONDS,
         )
         for line in reversed(proc.stdout.strip().splitlines()):
             line = line.strip()

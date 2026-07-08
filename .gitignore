@@ -16,3 +16,7 @@ runs/
 project_map.json
 # 個人環境的舊 cron 備份，不隨工具發布
 superseded/
+# PyInstaller 打包產物
+build/
+dist/
+*.spec

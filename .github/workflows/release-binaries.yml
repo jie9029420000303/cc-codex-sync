@@ -1,0 +1,42 @@
+name: release-binaries
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            asset: cc-codex-sync-macos-arm64
+          - os: macos-13
+            asset: cc-codex-sync-macos-intel
+          - os: windows-latest
+            asset: cc-codex-sync-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build single-file binary
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --name "${{ matrix.asset }}" --paths memsync memsync/cli.py
+      - name: Smoke test (status against empty home)
+        if: runner.os != 'Windows'
+        run: ./dist/${{ matrix.asset }} status
+      - name: Smoke test (status against empty home, Windows)
+        if: runner.os == 'Windows'
+        run: ./dist/${{ matrix.asset }} status
+        shell: pwsh
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.asset }}" --clobber
+        shell: bash
