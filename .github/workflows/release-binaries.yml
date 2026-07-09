@@ -3,6 +3,11 @@ name: release-binaries
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要上傳 assets 的既有 release tag（如 v1.2.0）"
+        required: true
 
 permissions:
   contents: write
@@ -10,12 +15,12 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # Intel macOS hosted runner（macos-13）已退役，不再提供 Intel 版；Intel Mac 請走原始碼模式
           - os: macos-latest
             asset: cc-codex-sync-macos-arm64
-          - os: macos-13
-            asset: cc-codex-sync-macos-intel
           - os: windows-latest
             asset: cc-codex-sync-windows-x64.exe
     runs-on: ${{ matrix.os }}
@@ -38,5 +43,5 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.asset }}" --clobber
+        run: gh release upload "${{ github.event.inputs.tag || github.ref_name }}" "dist/${{ matrix.asset }}" --clobber
         shell: bash
