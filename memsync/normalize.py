@@ -21,6 +21,21 @@ def slug(s: str) -> str:
     return s[:80] or "item"
 
 
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._一-鿿-]+$")
+
+
+def id_dir(logical_id: str) -> str:
+    """logical_id → 檔案系統安全的目錄名。
+
+    id 可能含 `:` `/`（如 remote:https://github.com/...）——Windows 禁用冒號、
+    斜線會被切成巢狀目錄。已安全的 id（含 __global__ 等既有 canonical 目錄名）
+    一律原樣返回（冪等、不破壞既有資料）；含非法字元的才轉 slug 並附短 hash 防截斷撞名。"""
+    if _SAFE_ID_RE.match(logical_id or ""):
+        return logical_id
+    s = slug(logical_id)
+    return f"{s[:60].rstrip('-.')}-{hashlib.sha1(logical_id.encode('utf-8')).hexdigest()[:8]}"
+
+
 @dataclass
 class Entry:
     logical_id: str

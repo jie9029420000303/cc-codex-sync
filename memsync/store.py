@@ -14,7 +14,7 @@ import json
 import re
 from pathlib import Path
 
-from normalize import Entry, slug as _slug
+from normalize import Entry, slug as _slug, id_dir as _id_dir
 import semantic
 
 
@@ -74,7 +74,7 @@ def input_hash(entries) -> str:
 
 def load_integrated(canonical_root: Path, logical_id: str):
     """回 (整合後文字 or None, 上次整合的 input_hash or None)。"""
-    d = canonical_root / logical_id
+    d = canonical_root / _id_dir(logical_id)
     doc = d / "integrated.md"
     meta = d / "integrated.meta.json"
     text = doc.read_text(encoding="utf-8", errors="replace") if doc.exists() else None
@@ -88,7 +88,7 @@ def load_integrated(canonical_root: Path, logical_id: str):
 
 
 def save_integrated(canonical_root: Path, logical_id: str, text: str, in_hash: str, generation: int) -> None:
-    d = canonical_root / logical_id
+    d = canonical_root / _id_dir(logical_id)
     d.mkdir(parents=True, exist_ok=True)
     (d / "integrated.md").write_text(text.rstrip() + "\n", encoding="utf-8")
     (d / "integrated.meta.json").write_text(
@@ -118,7 +118,7 @@ def merge_into_canonical(canonical_root: Path, logical_id: str, entries, generat
     來源以 origin_path（含歷次合併的 merged_paths 別名）對應 entry——語意合併的決定持久化，
     下輪直接命中、不重判不重呼叫 LLM。本輪沒出現的既有 entry 立即刪除（無寬限期）。
     回 (added, updated, unchanged, removed)。"""
-    d = canonical_root / logical_id / "entries"
+    d = canonical_root / _id_dir(logical_id) / "entries"
     d.mkdir(parents=True, exist_ok=True)
     added = updated = unchanged = 0
     current_keys: set = set()
@@ -208,7 +208,7 @@ def save_integrated_rule(canonical_root: Path, scope: str, text: str, in_hash: s
 
 
 def load_canonical_entries(canonical_root: Path, logical_id: str):
-    d = canonical_root / logical_id / "entries"
+    d = canonical_root / _id_dir(logical_id) / "entries"
     out = []
     if not d.exists():
         return out

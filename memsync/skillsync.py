@@ -24,7 +24,7 @@ import re
 import shutil
 from pathlib import Path
 
-from normalize import slug as _slug
+from normalize import slug as _slug, id_dir as _id_dir
 
 ORIGIN_FILE = ".memsync-origin"
 GLOBAL_SCOPE = "__global__"
@@ -129,7 +129,7 @@ def sync_pairs(pm: dict, extra_roots=()) -> list:
 # ---------- canonical ----------
 
 def canonical_skill_dir(canonical_root: Path, scope: str, name: str) -> Path:
-    return canonical_root / "__skills__" / scope / _slug(name)
+    return canonical_root / "__skills__" / _id_dir(scope) / _slug(name)
 
 
 def load_canonical_meta(cdir: Path):
@@ -168,7 +168,7 @@ def merge_pair(canonical_root: Path, scope: str, c_skills: dict, x_skills: dict,
     decisions = {name: {"winner": 'claude'|'codex'|None, "action": 'adopt'|'update'|'unchanged'|'zombie'}}"""
     decisions, conflicts = {}, []
     names = set(c_skills) | set(x_skills)
-    scope_dir = canonical_root / "__skills__" / scope
+    scope_dir = canonical_root / "__skills__" / _id_dir(scope)
     if scope_dir.exists():
         for d in scope_dir.iterdir():
             meta = load_canonical_meta(d) if d.is_dir() else None

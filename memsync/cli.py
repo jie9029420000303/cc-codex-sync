@@ -596,15 +596,17 @@ def cmd_sync(args):
         dual_ids = sorted(p for p, v in agg.items() if v[0] > 0 and v[1] > 0)
         print(f"兩側都有的專案（{len(dual_ids)}）：{dual_ids or '（無）'}")
 
+        # 磁碟目錄名＝id 經 norm.id_dir 安全轉換後的結果，比對前先把現況 id 也轉換
         existing_canonical = {d.name for d in CANONICAL.iterdir()
                               if d.is_dir() and not d.name.startswith("__")} if CANONICAL.exists() else set()
-        orphans = existing_canonical - all_ids
+        dir_to_id = {norm.id_dir(i): i for i in all_ids}
+        orphans = existing_canonical - set(dir_to_id)
         for oid in sorted(orphans):
             shutil.rmtree(CANONICAL / oid, ignore_errors=True)
             print(f"  🗑 專案身份已消失（可能路徑改名/搬移），整批清除 canonical/{oid}/")
 
         # 需要 collect（清殭屍 entry）：現存 canonical 且仍有任一側現況 ∪ 現在才變雙側的新專案
-        collect_ids = sorted((existing_canonical & all_ids) | set(dual_ids))
+        collect_ids = sorted({dir_to_id[d] for d in (existing_canonical & set(dir_to_id))} | set(dual_ids))
         projects = collect_ids
         # 已知殘留限制：若專案從雙側掉回單側，其 AGENTS.md/memory 顆粒不會在此清空，
         # 只有 canonical 內容會被 collect 清乾淨；完整清空受管 block 需之後再補。
